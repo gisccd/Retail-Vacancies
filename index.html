@@ -17,8 +17,8 @@
 /* =====================================================================
    CONFIG: this is the only section you should need to edit.
    Open the browser console (F12) on first load: the page prints every
-   layer in the web map and every field on each table it reads, and
-   warns about any HasVacancy value that doesn't match a space type below.
+   layer in the web map, which table it uses for businesses and brokers,
+   every field on each table, and how many rows link up at each step.
    Add ?debug to the page address (e.g. retail-vacancies.html?debug) to
    also print a report on how broker rows link to vacant spaces.
    ===================================================================== */
@@ -37,21 +37,22 @@ const CONFIG = {
   // so your custom basemap and the SEPTA, housing and district layers
   // keep the styling you gave them there.
   portalUrl: "https://ccdphila.maps.arcgis.com",
-  webMapId: "d07ddee9ac7d49fd9f1fcf59d7be7036",
+  webMapId: "7ddca435c459467194d2d1fb8c7d2787",
 
-  // Part of the service URL, used to find the right layers in the web map.
-  serviceName: "Retail_Vacancies_MIL1",
+  // Part of the hosted feature layer's URL, used to find its layers in the web map.
+  serviceName: "Retail_Vacancy_WFL1",
 
   // Layer numbers within that service (from its REST page).
-  // If a table isn't in the web map, the page looks for it in the same
-  // service by number, so you don't have to add tables to the web map.
+  // "auto" finds the table by its field names instead. Hosted copies in
+  // ArcGIS Online often renumber their tables (e.g. 4 and 5 become 1 and 2),
+  // so "auto" is the safe choice. The console says which table it picked.
   // Set businessesLayerId or brokersLayerId to null to skip them.
   propertiesLayerId: 0,
-  businessesLayerId: 4,
-  brokersLayerId: 5,
+  businessesLayerId: "auto",
+  brokersLayerId: "auto",
 
-  // How often an open page re-reads the data, in minutes, so edits made
-  // in ArcGIS Pro appear without a reload. 0 turns this off.
+  // How often an open page re-reads the data, in minutes, so edits to the
+  // hosted feature layer appear without a reload. 0 turns this off.
   refreshMinutes: 2,
 
   // Whether the "Map layers" box starts open. false = collapsed on load.
@@ -99,6 +100,8 @@ const CONFIG = {
 
   // ---- Businesses (vacant spaces inside each property) ----
   // Which business records count as vacant spaces.
+  // (Numbers in quotes, like '58', are fixed automatically when the field
+  // is numeric, since ArcGIS Online is stricter about this than Portal.)
   vacantSpacesWhere: "OccupancyStatus = 'Vacant' AND BusinessStatus = 'Active' AND Subtype <> '58'",
 
   // Spaces that still have a tenant but are on the market (lease ending).
@@ -387,12 +390,13 @@ const CONFIG = {
 <script>
 require([
   "esri/config",
+  "esri/request",
   "esri/WebMap",
   "esri/views/MapView",
   "esri/layers/FeatureLayer"
-], function (esriConfig, WebMap, MapView, FeatureLayer) {
+], function (esriConfig, esriRequest, WebMap, MapView, FeatureLayer) {
 
-  // Public page: never show a Portal sign-in window.
+  // Public page: never show a sign-in window.
   esriConfig.request.useIdentity = false;
 
   const F = CONFIG.fields, S = CONFIG.spaceFields, B = CONFIG.brokerFields, L = CONFIG.brokerLink;
@@ -433,7 +437,7 @@ require([
   // Space-type text in a form that ignores capitalization, extra or trailing
   // spaces, curly apostrophes, "&" vs "and", and "Second Generation" vs "Second-Gen".
   const normType = (v) => str(v).toLowerCase()
-    .replace(/[\u2018\u2019]/g, "'")
+    .replace(/[‘’]/g, "'")
     .replace(/\s*&\s*/g, " and ")
     .replace(/\s+/g, " ").trim()
     .replace(/^second[\s-]*gen(eration)?\b/, "second-gen");
@@ -536,9 +540,9 @@ require([
     }
   }
 
-  // Finds the properties, businesses and broker layers in the web map, and
+  // Finds the hosted feature layer's layers and tables in the web map, and
   // hides the web map's own copy of the vacancy points (this page draws its own).
-  function findDataLayers() {
+  async function findDataLayers() {
     const tables = (webMap.allTables || webMap.tables).toArray();
     const all = webMap.allLayers.toArray().concat(tables).filter((l) => l.url);
     console.info("Layers in the web map:");
@@ -546,21 +550,74 @@ require([
 
     const fromService = all.filter((l) => l.url.includes(CONFIG.serviceName));
     fromService.forEach((l) => { if ("visible" in l) l.visible = false; });
+    // Load them so their field lists are known.
+    await Promise.allSettled(fromService.map((l) => (l.load ? l.load() : null)));
 
-    const find = (id) => (id == null ? null : fromService.find((l) => Number(l.layerId) === Number(id)));
-    return {
-      props: find(CONFIG.propertiesLayerId),
-      spaces: find(CONFIG.businessesLayerId),
-      brokers: find(CONFIG.brokersLayerId),
-      hidden: new Set(fromService)
-    };
+    const byNum = (id) => (typeof id !== "number" ? null
+      : fromService.find((l) => Number(l.layerId) === id));
+    // The properties layer: by number, or failing that, the one with the HasVacancy field.
+    const props = byNum(CONFIG.propertiesLayerId) ||
+      fromService.find((l) => l.fieldsIndex && l.fieldsIndex.get(F.spaceType));
+    return { props, hidden: new Set(fromService) };
   }
 
-  // A table from the web map, or the same service by layer number if it isn't there.
-  function tableLayer(found, propsLayer, id) {
-    if (id == null) return null;
-    const src = found || propsLayer;
-    return new FeatureLayer({ url: src.url, layerId: found ? found.layerId : id, outFields: ["*"] });
+  // The service's own address (without the /0 layer number on the end).
+  const serviceRoot = (lyr) => str(lyr.url).replace(/\/+$/, "").replace(/\/\d+$/, "");
+
+  // Every layer and table in the service, loaded so their fields are known.
+  async function serviceTables(root, skipId) {
+    const res = await esriRequest(root, { query: { f: "json" }, responseType: "json" });
+    const entries = [...(res.data.layers || []), ...(res.data.tables || [])]
+      .filter((e) => Number(e.id) !== Number(skipId));
+    const lyrs = entries.map((e) =>
+      new FeatureLayer({ url: root, layerId: e.id, outFields: ["*"], title: e.name }));
+    await Promise.allSettled(lyrs.map((l) => l.load()));
+    return lyrs.filter((l) => l.loaded);
+  }
+
+  const has = (lyr, f) => !!(f && lyr.fieldsIndex && lyr.fieldsIndex.get(f));
+  const whereFields = (w) => [...str(w).matchAll(/([A-Za-z_]\w*)\s*(?:=|<>|!=|>=|<=|>|<|\bIN\b|\bLIKE\b|\bIS\b)/gi)]
+    .map((m) => m[1]);
+
+  // Picks the businesses and broker tables. A layer number in CONFIG is used
+  // as given; "auto" picks the table whose fields match the CONFIG field names.
+  async function findTables(propsLayer) {
+    const wantBiz = CONFIG.businessesLayerId, wantBrk = CONFIG.brokersLayerId;
+    if (wantBiz == null && wantBrk == null) return { spaces: null, brokers: null };
+    const root = serviceRoot(propsLayer);
+    const byNumber = (id) => new FeatureLayer({ url: root, layerId: id, outFields: ["*"] });
+
+    let spaces = typeof wantBiz === "number" ? byNumber(wantBiz) : null;
+    let brokers = typeof wantBrk === "number" ? byNumber(wantBrk) : null;
+
+    if (wantBiz === "auto" || wantBrk === "auto") {
+      const cands = await serviceTables(root, propsLayer.layerId);
+      const brokerScore = (l) => (has(l, L.brokerKey)
+        ? Object.values(B).filter((f) => has(l, f)).length : -1);
+      const bizScore = (l) => (has(l, L.businessKey) && has(l, S.propertyKey)
+        ? whereFields(CONFIG.vacantSpacesWhere).filter((f) => has(l, f)).length : -1);
+      const best = (list, score) => list
+        .map((l) => [l, score(l)]).filter(([, s]) => s >= 0)
+        .sort((a, b) => b[1] - a[1])[0]?.[0] || null;
+
+      if (wantBrk === "auto") brokers = best(cands.filter((l) => l !== spaces), brokerScore);
+      if (wantBiz === "auto") spaces = best(cands.filter((l) => l !== brokers), bizScore);
+
+      console.info("Tables in the service:");
+      console.table(cands.map((l) => ({
+        layerId: l.layerId, name: l.title,
+        usedFor: l === spaces ? "businesses" : l === brokers ? "brokers" : ""
+      })));
+      if (wantBiz === "auto" && !spaces) {
+        console.warn(`No table in the service has both "${L.businessKey}" and "${S.propertyKey}". ` +
+          "Check CONFIG.brokerLink.businessKey and CONFIG.spaceFields.propertyKey, or set businessesLayerId to a number.");
+      }
+      if (wantBrk === "auto" && !brokers) {
+        console.warn(`No table in the service has the broker fields (e.g. "${L.brokerKey}", "${B.company}"). ` +
+          "Check CONFIG.brokerFields, or set brokersLayerId to a number.");
+      }
+    }
+    return { spaces, brokers: spaces ? brokers : null };
   }
 
   // Warns in the console (once per table) about configured field names it doesn't have.
@@ -569,12 +626,24 @@ require([
     if (!lyr || !lyr.loaded || checked.has(label)) return;
     checked.add(label);
     const names = new Set((lyr.fields || []).map((f) => f.name));
-    console.info(`Fields on ${label}:`, [...names].join(", "));
+    console.info(`Fields on ${label} (layer ${lyr.layerId}):`, [...names].join(", "));
     const missing = Object.entries(map).filter(([, f]) => f && !names.has(f));
     if (missing.length) {
       console.warn(`${label}: these configured fields don't exist: ` +
         missing.map(([k, f]) => `${k} → "${f}"`).join(", "));
     }
+  }
+
+  // ArcGIS Online rejects a number in quotes (Subtype <> '58') when the field
+  // is numeric, so quotes around numbers are dropped for numeric fields.
+  const NUMERIC = new Set(["small-integer", "integer", "big-integer", "long", "single", "double", "oid"]);
+  function fixWhere(lyr, where) {
+    if (!where || !lyr.fieldsIndex) return where;
+    return where.replace(/\b([A-Za-z_]\w*)(\s*(?:=|<>|!=|>=|<=|>|<)\s*)'(-?\d+(?:\.\d+)?)'/g,
+      (m, f, op, n) => {
+        const fld = lyr.fieldsIndex.get(f);
+        return fld && NUMERIC.has(fld.type) ? `${f}${op}${n}` : m;
+      });
   }
 
   // Loads every matching row, a page at a time.
@@ -590,7 +659,7 @@ require([
       // createQuery() already carries the layer's filter (CONFIG.where for the
       // properties), so only replace it when a different filter is passed in.
       if (where) q.where = where;
-      if (!q.where) q.where = "1=1";
+      q.where = fixWhere(lyr, q.where) || "1=1";
       q.outFields = ["*"];
       q.returnGeometry = !!geometry;
       if (geometry) q.outSpatialReference = view.spatialReference;
@@ -605,7 +674,10 @@ require([
 
   // Loads a table, or returns no rows (with a console warning) if it fails.
   const loadOrEmpty = (lyr, opts, warning) => (lyr
-    ? loadAll(lyr, opts).catch((err) => { console.warn(warning, err); return []; })
+    ? loadAll(lyr, opts).catch((err) => {
+        console.warn(warning, err && err.details ? err.details : err);
+        return [];
+      })
     : Promise.resolve([]));
 
   // A property's space type as text. If HasVacancy has a coded-value domain
@@ -687,6 +759,50 @@ require([
     };
   }
 
+  // On the first load, prints how many rows link up at each step, and says
+  // in plain words which link is broken if one is.
+  let linksReported = false;
+  function reportLinks({ props, spaceRows, listedRows, brokerRows, listed }) {
+    if (linksReported) return;
+    linksReported = true;
+
+    const propKeys = new Set(props.map((g) => keyOf(val(g.attributes, F, "propertyKey"))));
+    const allBiz = spaceRows.concat(listedRows).map((g) => g.attributes);
+    const bizKeys = new Set(allBiz.map((a) => keyOf(a[L.businessKey])));
+    const brokersMatched = brokerRows.filter((g) => bizKeys.has(keyOf(g.attributes[L.brokerKey]))).length;
+    const spacesMatched = listed.filter((a) => propKeys.has(keyOf(val(a, S, "propertyKey")))).length;
+
+    console.info("How the data links up (first load):");
+    console.table({
+      "Properties loaded": props.length,
+      "Vacant spaces loaded": spaceRows.length,
+      "Occupied spaces loaded (lease-ending check)": listedRows.length,
+      "Broker rows loaded": brokerRows.length,
+      [`Broker rows whose ${L.brokerKey} matches a business ${L.businessKey}`]: brokersMatched,
+      [`Listed spaces whose ${S.propertyKey} matches a property ${F.propertyKey}`]: spacesMatched
+    });
+
+    const sample = (rows, field) => rows.slice(0, 3).map((a) => a[field]).join(", ");
+    if (spacesTable && !spaceRows.length && !listedRows.length) {
+      console.warn("No business rows loaded. See the warning above for the server's reason " +
+        "(often a field name in CONFIG.vacantSpacesWhere that doesn't exist on the hosted table).");
+    }
+    if (brokerRows.length && allBiz.length && !brokersMatched) {
+      console.warn(`None of the broker rows link to a business. brokers.${L.brokerKey} looks like ` +
+        `[${sample(brokerRows.map((g) => g.attributes), L.brokerKey)}] and businesses.${L.businessKey} ` +
+        `looks like [${sample(allBiz, L.businessKey)}]. If ${L.businessKey} is the businesses table's ` +
+        "GlobalID, ArcGIS Online gave the rows new GlobalIDs when the layer was published, so the old " +
+        "links no longer match. Republish with GlobalIDs preserved, or link on a regular ID field.");
+    }
+    if (listed.length && props.length && !spacesMatched) {
+      console.warn(`None of the listed spaces link to a property. businesses.${S.propertyKey} looks like ` +
+        `[${sample(listed, S.propertyKey)}] and properties.${F.propertyKey} looks like ` +
+        `[${sample(props.map((g) => g.attributes), F.propertyKey)}]. ArcGIS Online most likely gave the ` +
+        "properties new GlobalIDs when the layer was published, so the links stored in the businesses " +
+        "table no longer match. Republish with GlobalIDs preserved.");
+    }
+  }
+
   // Reads all three tables and joins them: property → listed spaces → brokers.
   // A listed space is either vacant, or still occupied but with a broker attached.
   async function fetchRecords() {
@@ -699,7 +815,7 @@ require([
             "Spaces with ending leases couldn't be loaded. Check CONFIG.listedSpacesWhere.")
         : Promise.resolve([]),
       loadOrEmpty(brokersTable, {},
-        "Brokers couldn't be loaded. Check CONFIG.brokersLayerId and that the broker table is shared publicly.")
+        "Brokers couldn't be loaded. Check CONFIG.brokersLayerId and that the hosted layer is shared publicly.")
     ]);
 
     checkFields(layer, F, "properties");
@@ -734,10 +850,7 @@ require([
       spacesByProperty.get(k).push(toSpace(a, brokersFor(a)));
     });
 
-    if (brokerRows.length && listed.length &&
-        ![...spacesByProperty.values()].some((list) => list.some((sp) => sp.brokers.length))) {
-      console.warn("Brokers loaded but none matched a listed space. Check CONFIG.brokerLink.");
-    }
+    reportLinks({ props, spaceRows, listedRows, brokerRows, listed });
 
     // Shown if HasVacancy holds a space type, or if an open business there has a broker.
     const out = props.map((g) => {
@@ -1246,14 +1359,14 @@ require([
 
       await view.when();
 
-      const found = findDataLayers();
+      const found = await findDataLayers();
       if (!found.props) {
         throw new Error(`No layer ${CONFIG.propertiesLayerId} from ${CONFIG.serviceName} in the web map. ` +
-          "See the table above for the layers it contains.");
+          "Check CONFIG.serviceName against the URLs in the table above.");
       }
 
       layer = new FeatureLayer({
-        url: found.props.url,
+        url: serviceRoot(found.props),
         layerId: found.props.layerId,
         outFields: ["*"],
         definitionExpression: CONFIG.where || null,
@@ -1265,8 +1378,12 @@ require([
       });
       view.map.add(layer);
 
-      spacesTable = tableLayer(found.spaces, found.props, CONFIG.businessesLayerId);
-      brokersTable = spacesTable ? tableLayer(found.brokers, found.props, CONFIG.brokersLayerId) : null;
+      const tables = await findTables(found.props).catch((err) => {
+        console.warn("Couldn't read the service's table list, so businesses and brokers are skipped.", err);
+        return { spaces: null, brokers: null };
+      });
+      spacesTable = tables.spaces;
+      brokersTable = tables.brokers;
 
       setupOverlays(found.hidden);
 
@@ -1280,8 +1397,8 @@ require([
       startAutoRefresh();
     } catch (err) {
       console.error(err);
-      console.warn("Listings failed to load. Check CONFIG.webMapId, CONFIG.propertiesLayerId and the field names " +
-        "in CONFIG.where.");
+      console.warn("Listings failed to load. Check CONFIG.webMapId, CONFIG.serviceName, " +
+        "CONFIG.propertiesLayerId and the field names in CONFIG.where.");
       els.count.textContent = "Listings unavailable";
       els.list.innerHTML = `<li class="empty"><p>Listings are temporarily unavailable.</p>
         <p>Please check back soon.</p></li>`;
